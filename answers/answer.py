@@ -125,7 +125,6 @@ def global_average_recommender(filename, seed):
     Test file: tests/test_global_average_recommender.py
     '''
     spark = init_spark()
-
     lines = spark.read.text(filename).rdd
     parts = lines.map(lambda row: row.value.split("::"))
     ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
@@ -134,12 +133,18 @@ def global_average_recommender(filename, seed):
     (training, test) = ratings.randomSplit([0.8, 0.2], seed)
 
     global_avg = training.select("rating").groupBy().mean().collect()[0][0]
-    global_training = training.withColumn('global_avg', lit(global_avg))
+    # Build the recommendation model using ALS on the training data
+    # Note we set cold start strategy to 'drop' to ensure we don't get NaN evaluation metrics
+    als = ALS(maxIter=5, rank=70, regParam=0.01, userCol="userId",
+              itemCol="movieId", ratingCol="rating", coldStartStrategy="drop",
+              seed=seed)
+    model = als.fit(training)
 
-    # Evaluate the model by computing the RMSE on the test data
-    evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating",
-                                    predictionCol="global_avg")
-    rmse = evaluator.evaluate(global_training)
+    # predictions =
+    predictions = model.transform(test).withColumn(colName="global_average", col=lit(global_avg))
+
+    evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating", predictionCol="global_average")
+    rmse = evaluator.evaluate(predictions)
     return rmse
 
 def means_and_interaction(filename, seed, n):
@@ -207,11 +212,37 @@ def als_with_bias_recommender(filename, seed):
     parameter. Test file: tests/test_als_with_bias_recommender.py
     '''
     spark = init_spark()
-
     lines = spark.read.text(filename).rdd
     parts = lines.map(lambda row: row.value.split("::"))
     ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
                                          rating=float(p[2]), timestamp=int(p[3])))
     ratings = spark.createDataFrame(ratingsRDD)
+
+    ratesum = ratings.groupBy().sum().collect()[0]
+    global_avg = ratesum[2] / ratings.count()
+
+    user_mean = ratings.groupBy("userId").mean().orderBy("userId")
+    movie_mean = ratings.groupBy("movieId").mean().orderBy("movieId")
+    ratings = ratings.withColumn(colName="global_average", col=lit(global_avg))
+
+    ratings = ratings.join(user_mean, "userId")
+    ratings = ratings.withColumnRenamed("avg(rating)", "user_mean")
+    ratings = ratings.join(movie_mean, "movieId")
+    ratings = ratings.withColumnRenamed("avg(rating)", "item_mean")
+
+    ratings = ratings.withColumn(colName="user_item_interaction",
+                                 col=ratings.rating - (ratings.user_mean + ratings.item_mean - ratings.global_average))
+
     (training, test) = ratings.randomSplit([0.8, 0.2], seed)
-    return 0
+
+    als = ALS(maxIter=5, rank=70, regParam=0.01, userCol="userId",
+              itemCol="movieId", ratingCol="user_item_interaction", coldStartStrategy="drop",
+              seed=seed)
+    model = als.fit(training)
+    predictions = model.transform(test)
+    predictions = predictions.withColumn("predicted_rating",
+                                         col=predictions.prediction + predictions.user_mean + predictions.item_mean - predictions.global_average)
+    # rmse on predicting rating
+    evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating", predictionCol="predicted_rating")
+    rmse = evaluator.evaluate(predictions)
+    return rmse
