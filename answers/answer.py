@@ -75,7 +75,27 @@ def basic_als_recommender(filename, seed):
     - coldStartStrategy: 'drop'
     Test file: tests/test_basic_als.py
     '''
-    return 0
+    spark = init_spark()
+
+    lines = spark.read.text(filename).rdd
+    parts = lines.map(lambda row: row.value.split("::"))
+    ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
+                                         rating=float(p[2]), timestamp=int(p[3])))
+    ratings = spark.createDataFrame(ratingsRDD)
+    (training, test) = ratings.randomSplit([0.8, 0.2], seed)
+
+    # Build the recommendation model using ALS on the training data
+    # Note we set cold start strategy to 'drop' to ensure we don't get NaN evaluation metrics
+    als = ALS(maxIter=5, rank=70, regParam=0.01, userCol="userId", itemCol="movieId", ratingCol="rating",
+              coldStartStrategy="drop")
+    als.setSeed(seed)
+    model = als.fit(training)
+
+    # Evaluation
+    predictions = model.transform(test)
+    evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating", predictionCol="prediction")
+    rmse = evaluator.evaluate(predictions)
+    return rmse
 
 def global_average(filename, seed):
     '''
@@ -84,7 +104,16 @@ def global_average(filename, seed):
     sets should be determined as before (e.g: as in function basic_als_recommender).
     Test file: tests/test_global_average.py
     '''
-    return 0
+    spark = init_spark()
+
+    lines = spark.read.text(filename).rdd
+    parts = lines.map(lambda row: row.value.split("::"))
+    ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
+                                         rating=float(p[2]), timestamp=int(p[3])))
+    ratings = spark.createDataFrame(ratingsRDD)
+    (training, test) = ratings.randomSplit([0.8, 0.2], seed)
+
+    return training.select("rating").groupBy().mean().collect()[0][0]
 
 def global_average_recommender(filename, seed):
     '''
@@ -95,7 +124,23 @@ def global_average_recommender(filename, seed):
     sets should be determined as before. You can add a column to an existing DataFrame with function *.withColumn(...)*.
     Test file: tests/test_global_average_recommender.py
     '''
-    return 0
+    spark = init_spark()
+
+    lines = spark.read.text(filename).rdd
+    parts = lines.map(lambda row: row.value.split("::"))
+    ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
+                                         rating=float(p[2]), timestamp=int(p[3])))
+    ratings = spark.createDataFrame(ratingsRDD)
+    (training, test) = ratings.randomSplit([0.8, 0.2], seed)
+
+    global_avg = training.select("rating").groupBy().mean().collect()[0][0]
+    global_training = training.withColumn('global_avg', lit(global_avg))
+
+    # Evaluate the model by computing the RMSE on the test data
+    evaluator = RegressionEvaluator(metricName="rmse", labelCol="rating",
+                                    predictionCol="global_avg")
+    rmse = evaluator.evaluate(global_training)
+    return rmse
 
 def means_and_interaction(filename, seed, n):
     '''
@@ -121,7 +166,33 @@ def means_and_interaction(filename, seed, n):
     Note, this function should return a list of collected Rows. Please, have a
     look at the test file to ensure you have the right format.
     '''
-    return []
+    spark = init_spark()
+
+    lines = spark.read.text(filename).rdd
+    parts = lines.map(lambda row: row.value.split("::"))
+    ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
+                                         rating=float(p[2]), timestamp=int(p[3])))
+    ratings = spark.createDataFrame(ratingsRDD)
+    (training, test) = ratings.randomSplit([0.8, 0.2], seed)
+
+    # global average
+    global_avg = training.select("rating").groupBy().mean().collect()[0][0]
+    # get the user bias column
+    user_mean = training.select("userId", "rating").groupBy("userId").mean().orderBy("userId").select("userId",
+                                                                                                      "avg(rating)")
+    user_mean = user_mean.withColumnRenamed("avg(rating)", "user_mean")
+    # get the item bias column
+    item_mean = training.select("userId", "movieId", "rating").groupBy("movieId").mean().orderBy("movieId").select(
+        "movieId", "avg(rating)")
+    item_mean = item_mean.withColumnRenamed("avg(rating)", "item_mean")
+    # combine user and item bias columns in training df
+    combined = training.join(user_mean, ['userId']).join(item_mean, ['movieId'])
+    combined = combined.select("userId", "movieId", "rating", "user_mean", "item_mean")
+    # combine all with user item interaction
+    final_combined = combined.withColumn('user_item_interaction',
+                                         combined.rating - (combined.user_mean + combined.item_mean - global_avg))
+    combined_order = final_combined.orderBy("userId", "movieId").collect()
+    return combined_order[:n]
 
 def als_with_bias_recommender(filename, seed):
     '''
@@ -135,4 +206,12 @@ def als_with_bias_recommender(filename, seed):
     as before and be initialized with the random seed passed as 
     parameter. Test file: tests/test_als_with_bias_recommender.py
     '''
+    spark = init_spark()
+
+    lines = spark.read.text(filename).rdd
+    parts = lines.map(lambda row: row.value.split("::"))
+    ratingsRDD = parts.map(lambda p: Row(userId=int(p[0]), movieId=int(p[1]),
+                                         rating=float(p[2]), timestamp=int(p[3])))
+    ratings = spark.createDataFrame(ratingsRDD)
+    (training, test) = ratings.randomSplit([0.8, 0.2], seed)
     return 0
